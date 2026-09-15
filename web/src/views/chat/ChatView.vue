@@ -71,18 +71,29 @@
           >
             <div class="msg-avatar">{{ msg.role === 'user' ? '🧑' : '🤖' }}</div>
             <div class="msg-bubble">
-              <div class="msg-content">{{ plainText(msg.content) }}</div>
+              <div class="msg-content">
+                <template v-for="(p, pi) in renderContentParts(msg)" :key="pi">
+                  <span v-if="p.type === 'text'">{{ p.value }}</span>
+                  <button
+                    v-else
+                    type="button"
+                    class="cite-badge"
+                    :title="`查看来源：${p.src.document_name || ''}`"
+                    @click="openVerify(p.src)"
+                  >[{{ p.no }}]</button>
+                </template>
+              </div>
               <div v-if="msg.role === 'assistant' && cleanSources(msg.sources).length > 0" class="msg-sources">
                 <div class="source-title">📎 引用来源（点击可查看原文验真）</div>
                 <div
                   v-for="(s, i) in cleanSources(msg.sources)"
-                  :key="`${s.document_id}_${s.chunk_index}_${i}`"
+                  :key="`${s.document_id}_${i}`"
                   class="source-item source-item--link"
-                  title="点击查看该引用在原文件中的原文片段"
+                  :title="`点击查看《${s.document_name || ''}》的原文片段`"
                   @click="openVerify(s)"
                 >
                   <span class="source-link">
-                    [{{ i + 1 }}] {{ s.document_name ? s.document_name.replace(/\s+/g, ' ').trim() : ('来源 ' + (i + 1)) }}
+                    <span class="source-no">{{ i + 1 }}</span>{{ s.document_name ? s.document_name.replace(/\s+/g, ' ').trim() : ('来源 ' + (i + 1)) }}
                   </span>
                   <span class="score">相似度：{{ (s.score || 0).toFixed(3) }}</span>
                 </div>
@@ -144,17 +155,23 @@
 
           <div v-if="verifyData.prev" class="verify-context verify-context--around">
             <div class="ctx-label">上文</div>
-            <div class="ctx-text">{{ formatChunkText(verifyData.prev) }}</div>
+            <div class="ctx-text">
+              <p v-for="(p, i) in chunkParagraphs(verifyData.prev)" :key="i" class="ctx-para">{{ p }}</p>
+            </div>
           </div>
 
           <div class="verify-context verify-context--hit">
             <div class="ctx-label">🎯 AI 引用的原文片段</div>
-            <div class="ctx-text">{{ formatChunkText(verifyData.current) }}</div>
+            <div class="ctx-text">
+              <p v-for="(p, i) in chunkParagraphs(verifyData.current)" :key="i" class="ctx-para">{{ p }}</p>
+            </div>
           </div>
 
           <div v-if="verifyData.next" class="verify-context verify-context--around">
             <div class="ctx-label">下文</div>
-            <div class="ctx-text">{{ formatChunkText(verifyData.next) }}</div>
+            <div class="ctx-text">
+              <p v-for="(p, i) in chunkParagraphs(verifyData.next)" :key="i" class="ctx-para">{{ p }}</p>
+            </div>
           </div>
 
           <div class="verify-actions">
@@ -229,12 +246,61 @@ function revokeVerifyBlob() {
   }
 }
 
-// chunk 原文里 PDF 解析注入的 --- Page N --- 锚点，转成可读的页码徽标文本
-function formatChunkText(text) {
-  if (!text) return ''
-  return plainText(String(text))
-    .replace(/---\s*Page\s+(\d+)\s*---/g, '〔第 $1 页〕')
-    .replace(/^\s+/, '')
+// PDF/DOCX 提取出的文本保留了排版时的物理换行（部分提取器甚至每行后还带空行），
+// 直接原样显示会把一句话拆成一堆短行。这里按"视觉行"重组：
+// 句中的硬换行直接拼回，只有编号条目/标题/句末标点才作为段落边界。
+function chunkParagraphs(text) {
+  if (!text) return []
+  const normalized = String(text).replace(/\r\n?/g, '\n')
+  const lines = normalized
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (!lines.length) return []
+
+  // 每页重复出现的水印/页脚短行（独占一行时剔除，不影响前后句子衔接）
+  const NOISE_LINE = /^(仅供.{0,20}内部使用|内部资料(?:，?请勿外传)?|第\s*\d+\s*页(?:\s*[，/／]\s*共\s*\d+\s*页)?)$/
+  // 纯章节编号行：1.4.0 / 2.1（后面紧跟标题，合并时补一个空格）
+  const SECTION_NUM = /^\d+(?:\.\d+)+[.、)）]?$/
+  // 编号/标题行：1. / 1、 / 2） / 1.4.2 / 第X条 / （1） / - 项目符号
+  const ITEM_START = /^(?:\d+(?:\.\d+)+[.、)）]?\s*|\d+\s*[.、)）]\s*|第[一二三四五六七八九十百千0-9]+[条章节部分点][、.．]?\s*|[（(][0-9一二三四五六七八九十]+[)）]\s*|[-•·*▪◦]\s+)/
+  // 句末标点（含右括号/引号），表示一个句子已结束
+  const SENTENCE_END = /[。！？；;.!?…」』）)]$/
+  const ASCII_TAIL = /[A-Za-z0-9]$/
+  const ASCII_HEAD = /^[A-Za-z0-9]/
+
+  const paras = []
+  let buf = ''
+  const flush = () => {
+    if (buf) paras.push(buf)
+    buf = ''
+  }
+
+  for (let raw of lines) {
+    // 去掉 Markdown 残留符号
+    let line = plainText(raw).trim()
+    // 规范化条目编号内的空白："2 、" → "2、"（"1. 文字"这类点后空格保留）
+    line = line.replace(/^(\d+(?:\.\d+)*)\s+([、)）])/, '$1$2')
+    // PDF 页头标记转可读形式
+    line = line.replace(/^-{2,}\s*Page\s+(\d+)\s*-{2,}$/i, '〔第 $1 页〕')
+    if (!line || NOISE_LINE.test(line)) continue
+
+    if (!buf) {
+      buf = line
+      continue
+    }
+    // 上一句已结束，或本行是编号/标题 → 另起段落；否则视为 PDF 硬换行拼回
+    if (SENTENCE_END.test(buf) || ITEM_START.test(line)) {
+      flush()
+      buf = line
+    } else {
+      // 章节号与标题之间、纯英文/数字交界处补空格，中文之间直接相连
+      const gap = SECTION_NUM.test(buf) || (ASCII_TAIL.test(buf) && ASCII_HEAD.test(line)) ? ' ' : ''
+      buf += gap + line
+    }
+  }
+  flush()
+  return paras
 }
 
 async function openVerify(source) {
@@ -312,8 +378,9 @@ watch(verifyVisible, (v) => {
  * 引用来源清洗（前端最后一道过滤保险，兜底历史脏数据或后端异常）：
  * 1) 兼容 sources 是 JSON 字符串的旧数据（手动 parse）；
  * 2) 移除 score <= 0 的噪声/占位；
- * 3) 对 (document_id, chunk_index) 去重，保留最高分；
- * 4) 按 score 降序排序并重新编号；
+ * 3) 按「文档」去重：同一文档的多个 chunk 只保留一张卡片（最高分片段为代表，点击验真打开该片段）；
+ * 4) 按代表片段 score 降序排序——与后端 prompt 的文档首次出现顺序一致，
+ *    因此卡片下标 +1 就是回答中 [1][2] 角标的序号；
  * 5) 返回 [] 时 UI 整个「引用来源」块自动隐藏。
  */
 function cleanSources(sources) {
@@ -324,18 +391,52 @@ function cleanSources(sources) {
     try { arr = JSON.parse(arr) } catch { arr = [] }
   }
   if (!Array.isArray(arr) || arr.length === 0) return []
-  const dedup = new Map()
+  const byDoc = new Map()
   for (const s of arr) {
     if (!s || typeof s !== 'object') continue
     const sc = Number(s.score ?? 0) || 0
     if (sc <= 0) continue
-    const key = `${s.document_id ?? 0}_${s.chunk_index ?? 0}`
-    const prev = dedup.get(key)
+    const docKey = s.document_id ?? 0
+    const prev = byDoc.get(docKey)
     if (!prev || sc > (Number(prev.score ?? 0) || 0)) {
-      dedup.set(key, { ...s, score: sc })
+      byDoc.set(docKey, { ...s, score: sc })
     }
   }
-  return Array.from(dedup.values()).sort((a, b) => (b.score || 0) - (a.score || 0))
+  return Array.from(byDoc.values()).sort((a, b) => (b.score || 0) - (a.score || 0))
+}
+
+/**
+ * 把回答正文切成「文本 + 引用角标」片段：
+ * - 新格式 [1]：序号直接对应 cleanSources 去重后的第 N 张文档卡片；
+ * - 历史格式 [Doc#26]：按 document_id 反查卡片序号，旧对话也能点击；
+ * - 超出范围/对不上的标注（模型偶发幻觉）按普通文本原样显示。
+ */
+function renderContentParts(msg) {
+  const text = plainText(msg.content || '')
+  const srcs = msg.role === 'assistant' ? cleanSources(msg.sources) : []
+  const parts = []
+  const re = /\[(Doc#)?(\d+)\]/g
+  let last = 0
+  let m
+  while ((m = re.exec(text))) {
+    if (m.index > last) parts.push({ type: 'text', value: text.slice(last, m.index) })
+    let src = null
+    if (m[1]) {
+      src = srcs.find((s) => String(s.document_id) === m[2]) || null
+    } else {
+      const n = parseInt(m[2], 10)
+      src = n >= 1 && n <= srcs.length ? srcs[n - 1] : null
+    }
+    if (src) {
+      const no = srcs.indexOf(src) + 1
+      parts.push({ type: 'cite', no, src })
+    } else {
+      parts.push({ type: 'text', value: m[0] })
+    }
+    last = re.lastIndex
+  }
+  if (last < text.length) parts.push({ type: 'text', value: text.slice(last) })
+  return parts
 }
 
 onMounted(async () => {
@@ -681,6 +782,29 @@ function handleQuickSend() {
   .msg-content {
     white-space: pre-wrap;
   }
+  .cite-badge {
+    display: inline-block;
+    margin: 0 2px;
+    padding: 0 6px;
+    min-width: 20px;
+    height: 17px;
+    line-height: 16px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #4f46e5;
+    background: #eef2ff;
+    border: 1px solid #c7d2fe;
+    border-radius: 9px;
+    cursor: pointer;
+    vertical-align: baseline;
+    font-family: inherit;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    &:hover {
+      color: #fff;
+      background: #6366f1;
+      border-color: #6366f1;
+    }
+  }
   .msg-sources {
     margin-top: 10px;
     padding: 10px 12px;
@@ -714,6 +838,22 @@ function handleQuickSend() {
       transition: background 0.15s;
       .source-link {
         color: #4f46e5;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .source-no {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 5px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #fff;
+        background: #6366f1;
+        border-radius: 9px;
       }
       &:hover {
         background: rgba(79, 70, 229, 0.08);
@@ -796,10 +936,19 @@ function handleQuickSend() {
   border-radius: 8px;
   padding: 12px 14px;
   margin-bottom: 10px;
-  line-height: 1.85;
-  font-size: 13.5px;
+  line-height: 1.8;
+  font-size: 14px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.ctx-text {
+  .ctx-para {
+    margin: 0 0 8px;
+    text-align: justify;
+    &:last-child {
+      margin-bottom: 0;
+    }
+  }
 }
 .verify-context--around {
   background: #f9fafb;
