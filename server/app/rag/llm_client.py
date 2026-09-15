@@ -91,17 +91,18 @@ class _OpenAICompatibleLLM:
         self.name = name
         self._mock_fallback = _MockLLM()
 
-    async def chat_stream(
+    async def _stream_once(
         self,
         messages: List[Dict[str, str]],
-        *,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> AsyncGenerator[Tuple[str, Optional[int]], None]:
-        if temperature is None:
-            temperature = settings.LLM_TEMPERATURE
-        if max_tokens is None:
-            max_tokens = settings.LLM_MAX_TOKENS
+        temperature: float,
+        max_tokens: int,
+    ) -> AsyncGenerator[Tuple[str, Optional[int], Optional[str]], None]:
+        """发起一次流式请求，逐个 yield (content_delta, total_tokens, finish_reason)。
+
+        思考型模型（如 deepseek-v4-flash）会把思维链放在 delta.reasoning_content，
+        该部分不透传给调用方（属于内部推理），只记录字符数用于日志；正文取 delta.content。
+        网络/HTTP 异常向上抛出，由 chat_stream 统一决定降级策略。
+        """
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -115,51 +116,106 @@ class _OpenAICompatibleLLM:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        total_tokens = 0
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=30.0)) as client:
-                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+        total_tokens: Optional[int] = None
+        reasoning_chars = 0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                try:
+                    resp.raise_for_status()
+                except Exception:
+                    body = ""
                     try:
-                        resp.raise_for_status()
+                        body = await resp.aread()
                     except Exception:
-                        # 捕获 HTTP 错误体
-                        body = ""
-                        try:
-                            body = await resp.aread()
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"HTTP {resp.status_code}: {body[:300]}")
-                    async for line in resp.aiter_lines():
-                        line = line.strip()
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[len("data:"):].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        choices = obj.get("choices") or []
-                        usage = obj.get("usage")
-                        if usage:
-                            total_tokens = int(usage.get("total_tokens") or total_tokens)
-                        for c in choices:
-                            delta = (c.get("delta") or {}).get("content", "")
-                            finish = c.get("finish_reason")
-                            if delta:
-                                yield delta, None
-                            if finish:
-                                break
+                        pass
+                    raise RuntimeError(f"HTTP {resp.status_code}: {body[:300]}")
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = obj.get("choices") or []
+                    usage = obj.get("usage")
+                    if usage:
+                        total_tokens = int(usage.get("total_tokens") or 0) or total_tokens
+                    for c in choices:
+                        delta_obj = c.get("delta") or {}
+                        content = delta_obj.get("content", "") or ""
+                        rc = delta_obj.get("reasoning_content")
+                        if rc:
+                            reasoning_chars += len(rc)
+                        finish = c.get("finish_reason")
+                        if content:
+                            yield content, total_tokens, finish
+                        elif finish:
+                            yield "", total_tokens, finish
+        logger.debug(
+            "[LLM] 单次流结束 model=%s max_tokens=%s reasoning_chars=%s total_tokens=%s",
+            self.model, max_tokens, reasoning_chars, total_tokens,
+        )
+
+    async def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        _is_retry: bool = False,
+    ) -> AsyncGenerator[Tuple[str, Optional[int]], None]:
+        if temperature is None:
+            temperature = settings.LLM_TEMPERATURE
+        budget = max_tokens or settings.LLM_MAX_TOKENS
+        content_parts: List[str] = []
+        total_tokens: Optional[int] = None
+        finish_reason: Optional[str] = None
+        try:
+            async for delta, tok, finish in self._stream_once(messages, temperature, budget):
+                if delta:
+                    content_parts.append(delta)
+                    yield delta, None
+                if tok:
+                    total_tokens = tok
+                if finish:
+                    finish_reason = finish
         except Exception as e:
             logger.error(
                 "[LLM] 流式调用失败，降级为 Mock。provider=%s model=%s err=%s",
                 self.name, self.model, str(e),
             )
-            async for d, t in self._mock_fallback.chat_stream(messages, temperature=temperature, max_tokens=max_tokens):
+            async for d, t in self._mock_fallback.chat_stream(
+                messages, temperature=temperature, max_tokens=budget
+            ):
                 yield d, t
             return
-        yield "", total_tokens or None
+
+        # 思考模型把预算全部耗在 reasoning_content 上时，正文一个字都没产出就被
+        # finish_reason=length 截断（历史故障：UI 只剩引用来源、回答空白且无任何报错）。
+        # 此时尚未向前端吐过任何正文，自动以翻倍预算静默重试一次；仍失败则显式报错，
+        # 绝不允许"零正文 + 200 成功"这种静默空答。
+        if not "".join(content_parts).strip() and finish_reason == "length":
+            MAX_RETRY_BUDGET = 32768
+            if not _is_retry and budget < MAX_RETRY_BUDGET:
+                new_budget = min(budget * 2, MAX_RETRY_BUDGET)
+                logger.warning(
+                    "[LLM] 正文为空且输出被 max_tokens=%s 截断（思维链耗尽预算），翻倍至 %s 重试 model=%s",
+                    budget, new_budget, self.model,
+                )
+                async for d, t in self.chat_stream(
+                    messages, temperature=temperature, max_tokens=new_budget, _is_retry=True
+                ):
+                    yield d, t
+                return
+            raise RuntimeError(
+                f"大模型输出被 token 上限截断（max_tokens={budget}），思维链耗尽预算导致正文未生成。"
+                f"请在 .env 调大 LLM_MAX_TOKENS（当前 {budget}，建议 8192 或更高）后重试。"
+            )
+        yield "", total_tokens
 
     def chat(self, messages: List[Dict[str, str]], **kw) -> Tuple[str, int]:
         if kw.get("temperature") is None:
@@ -173,13 +229,31 @@ class _OpenAICompatibleLLM:
         }
         payload = {"model": self.model, "messages": messages, "stream": False, **{k: v for k, v in kw.items() if v is not None}}
         try:
-            with httpx.Client(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
+            with httpx.Client(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
                 r = client.post(url, headers=headers, json=payload)
                 r.raise_for_status()
                 data = r.json()
-                content = data["choices"][0]["message"].get("content", "")
+                choice = (data.get("choices") or [{}])[0]
+                content = (choice.get("message") or {}).get("content", "") or ""
+                finish = choice.get("finish_reason")
                 usage = data.get("usage") or {}
+                # 与流式一致：思考模型正文为空且 length 截断时，翻倍预算重试一次
+                if not content.strip() and finish == "length":
+                    budget = int(kw["max_tokens"] or settings.LLM_MAX_TOKENS)
+                    if budget < 32768:
+                        new_budget = min(budget * 2, 32768)
+                        logger.warning(
+                            "[LLM] 非流式正文为空且被 max_tokens=%s 截断，翻倍至 %s 重试 model=%s",
+                            budget, new_budget, self.model,
+                        )
+                        kw["max_tokens"] = new_budget
+                        return self.chat(messages, **kw)
+                    raise RuntimeError(
+                        f"大模型输出被 token 上限截断（max_tokens={budget}），正文未生成，请调大 LLM_MAX_TOKENS。"
+                    )
                 return content, int(usage.get("total_tokens") or len(content))
+        except RuntimeError:
+            raise
         except Exception as e:
             logger.error(
                 "[LLM] 同步调用失败，降级为 Mock。provider=%s model=%s err=%s",

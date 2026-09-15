@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_MODEL: str = "qwen-plus"
     LLM_TEMPERATURE: float = 0.1
-    LLM_MAX_TOKENS: int = 2048
+    LLM_MAX_TOKENS: int = 8192
 
     # 视觉模型（图片入库链路）：上传图片时由多模态模型做 OCR + 图像理解，
     # 把图片内容转成结构化文本，再走与普通文档相同的 切片→Embedding→Chroma 检索链路。
