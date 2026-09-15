@@ -198,7 +198,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import { useChatStore } from '@/stores/chat'
 import { useKbStore } from '@/stores/knowledgeBase'
-import { updateConversationApi } from '@/api/chat'
 import { buildChatStreamUrl } from '@/api/chat'
 import { getChunkContextApi, fetchDocumentFileApi } from '@/api/document'
 import { useUserStore } from '@/stores/user'
@@ -468,11 +467,10 @@ function scrollBottom() {
 }
 
 async function handleNewChat() {
-  const kbName = currentKbId.value
-    ? kbStore.list.find((k) => k.id === currentKbId.value)?.name || ''
-    : ''
-  const title = kbName ? `${kbName} 对话` : '新对话'
-  await chatStore.createOne({ kb_id: currentKbId.value || null, title, mode: 'chat' })
+  // 新建对话必须是"干净"的：清空下拉框选中值，不带任何知识库关联，
+  // 标题使用默认「新对话」。知识库由用户在新对话里显式选择，选择后标题才联动。
+  currentKbId.value = null
+  await chatStore.createOne({ kb_id: null, title: '新对话', mode: 'chat' })
   inputText.value = ''
 }
 
@@ -512,21 +510,26 @@ async function handleKbChange(val) {
   const newKb = val === undefined || val === '' ? null : val
   const oldKb = chatStore.currentConversation.kb_id
   if (newKb === oldKb) return
+  // 标题随知识库联动：选中知识库 → 「知识库名 对话」；清空 → 恢复默认「新对话」。
+  // kb_id 与 title 在同一次请求提交，服务端对 kb_id 做归属校验（硬约束）。
+  const kbName = newKb
+    ? kbStore.list.find((k) => k.id === newKb)?.name || ''
+    : ''
+  const newTitle = kbName ? `${kbName} 对话` : '新对话'
+  const oldTitle = chatStore.currentConversation.title
   try {
-    const res = await updateConversationApi(chatStore.currentConversation.id, { kb_id: newKb })
-    // 以服务端返回的 data.kb_id 为准（拦截器已抛 code!=0，这里必然 code=0）
-    if (res?.data && typeof res.data.kb_id !== 'undefined') {
-      chatStore.currentConversation.kb_id = res.data.kb_id
-      currentKbId.value = res.data.kb_id
-    } else {
-      chatStore.currentConversation.kb_id = newKb
-      currentKbId.value = newKb
-    }
+    // updateOne 会用服务端返回的最新会话同时替换列表项和当前会话，侧边栏标题同步更新
+    const item = await chatStore.updateOne(chatStore.currentConversation.id, {
+      kb_id: newKb,
+      title: newTitle,
+    })
+    currentKbId.value = item && typeof item.kb_id !== 'undefined' ? item.kb_id : newKb
     ElMessage.success(newKb ? '已关联知识库' : '已取消关联')
   } catch (e) {
-    // 拦截器已提示具体错误，这里严格回滚 UI 状态
+    // 拦截器已提示具体错误，这里严格回滚 UI 状态（选中值、kb_id、标题）
     currentKbId.value = oldKb
     chatStore.currentConversation.kb_id = oldKb
+    chatStore.currentConversation.title = oldTitle
   }
 }
 
