@@ -12,7 +12,7 @@
 - 📚 **知识库管理**：知识库 CRUD、配置（TopK / 相似度阈值 / 分块大小 / 重叠 / 是否公开）
 - 📄 **文档管理**：上传 PDF/DOCX/TXT/MD、文件列表、删除、处理状态展示
 - 💬 **智能对话**：多会话管理、关联知识库、SSE 流式问答、引用来源展示
-- 🧩 **RAG 管线占位**：`server/app/rag/` 下预留八大核心模块，后续按阶段实现
+- 🧩 **RAG 核心管线**：`server/app/rag/` 下已实现九大核心模块（文档解析 → 分块 → Embedding → 向量库 → 检索降级 → LLM 流式 → 引用标注 → 图片理解）
 
 ---
 
@@ -118,16 +118,19 @@ docker compose up -d --build
 
 ---
 
-## 🧪 下一步：RAG 管线实现路线
+## 🧪 RAG 管线模块一览
 
-| 阶段 | 模块 | 要点 |
+| 模块 | 行数 | 功能 |
 |------|------|------|
-| 1 | `rag/document_parser.py` | PyMuPDF + python-docx + unstructured，提取纯文本 + 表格 |
-| 2 | `rag/text_chunker.py` | 标题层级分块 + 递归字符分块 + Parent-Child 父子分块 |
-| 3 | `rag/embedding.py` + `vector_store.py` | BGE 中文嵌入 + Chroma 持久化，按 kb_id 隔离 collection |
-| 4 | `rag/retriever.py` | 向量稠密检索 + BM25 稀疏 → RRF 融合 → Cross-Encoder 重排序 |
-| 5 | `rag/llm_client.py` + `prompt_templates.py` | OpenAI 兼容 SSE 流式 + 查询改写 / 问答 / 引用标注 Prompt |
-| 6 | `rag/pipeline.py` | 串联端到端管线，替换 `services/chat_service.py` 中占位的模拟回答 |
+| `rag/document_parser.py` | 111 | PDF/DOCX/TXT/MD 解析，PyMuPDF + python-docx，提取纯文本 + 表格 + 页码锚点 |
+| `rag/text_chunker.py` | 104 | 硬换行合并、编号条目格式化、水印行移除、章节编号与标题分离 |
+| `rag/embedding.py` | 162 | DashScope Embedding API，batch≤10，向量模型不可用时抛错不降级 |
+| `rag/vector_store.py` | 259 | Chroma 持久化存储，按 kb_id 隔离 collection，内嵌 BM25 词面检索兜底 |
+| `rag/retriever.py` | 116 | 向量稠密检索 → 捕获 EmbeddingUnavailableError 自动降级为关键词检索 |
+| `rag/llm_client.py` | 282 | OpenAI 兼容 SSE 流式，思维链预算吞噬自动翻倍重试（上限 32768） |
+| `rag/prompt_templates.py` | 50 | 问答 / 引用序号标注 Prompt 模板，输出纯文本无 Markdown |
+| `rag/pipeline.py` | 248 | 端到端管线（入库 + 问答），串联上述所有模块 |
+| `rag/vision.py` | 136 | 图片理解，视觉模型支持 |
 
 ---
 
