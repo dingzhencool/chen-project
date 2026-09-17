@@ -36,3 +36,6 @@ web/logs/
 
 # Personal
 项目简历-精简版.pdf
+
+# Tests (含本地测试隐私信息，不提交到仓库)
+server/tests/
