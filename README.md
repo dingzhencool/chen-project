@@ -1,12 +1,12 @@
-# 企业级 RAG 知识库系统 (MVP)
+# 企业级 RAG 知识库系统
 
-基于 **FastAPI + Vue 3 + Vite + Element Plus + Pinia + MySQL + Chroma** 的企业级检索增强生成（RAG）智能知识库系统 MVP 版本。
+基于 **FastAPI + Vue 3 + Vite + Element Plus + Pinia + MySQL + Chroma** 的企业级检索增强生成（RAG）智能知识库系统。
 
 > 该项目参考了 GitHub 上 RAGFlow / FastGPT / MaxKB 等成熟项目的架构，采用**前后端完全物理隔离**的工程结构，方便后续容器化、CI/CD 分层部署与独立迭代。
 
 ---
 
-## ✨ MVP 功能范围
+## ✨ 功能范围
 
 - 🔐 **用户体系**：注册 / 登录 / JWT 鉴权 / 个人中心 / 密码修改
 - 📚 **知识库管理**：知识库 CRUD、配置（TopK / 相似度阈值 / 分块大小 / 重叠 / 是否公开）
@@ -84,7 +84,7 @@ mianshi1/
 ### 1. 启动依赖
 
 - **MySQL 8.x**：需要创建数据库 `enterprise_rag`（后端启动时会自动建表）
-- **Redis 7.x**（MVP 阶段可选，接口已预留）
+- **Redis 7.x**（可选，接口已预留，用于缓存/会话管理）
 - **Python 3.10+** / **Node 18+**
 
 ### 2. 后端
