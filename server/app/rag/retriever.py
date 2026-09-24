@@ -1,4 +1,4 @@
-"""检索器：向量稠密检索 + 简单关键词重排 + 文档去重。
+"""检索器：向量稠密检索 + Rerank 精排（DashScope gte-rerank） + 文档去重。
 
 硬保险机制（按优先级）：
 1) __init__ 启动指纹（fingerprint=RAG_RETRIEVER_V2_20260821）写入 INFO，用于确认新代码已加载。
@@ -6,11 +6,14 @@
    缓存的 0.6 把泛 query 全挡掉。
 3) 全景最高分 ≥ 0.30 但被阈值挡住时，强制放行（比"零命中兜底"更早生效）。
 4) 最终零命中兜底仍保留：实在没命中就取 top 相近 2 条给 LLM，不乱答。
+5) Rerank 启用时：召回阶段放宽阈值拉 RERANK_RECALL_TOP_K 条候选 → 调 gte-rerank 重排
+   → 取 top_k 返回；rerank 失败自动回退到原向量排序，不阻断问答。
 """
 from typing import List
 
 from app.core.config import settings
 from app.rag.embedding import embedding_service
+from app.rag.reranker import reranker
 from app.rag.vector_store import SearchHit, get_vector_store
 from app.utils.logger import get_logger
 
@@ -58,6 +61,17 @@ class Retriever:
                      kb_id, top_k, threshold, provider, _FINGERPRINT, query[:80])
         query_vec = embedding_service().embed_one(query)
 
+        # --- Rerank 路径：放宽阈值拉大候选池，交给 gte-rerank 精排 ---
+        if settings.RERANK_ENABLED:
+            return self._retrieve_with_rerank(kb_id, query, query_vec, top_k, provider)
+
+        # --- 原始路径（无 rerank）：带阈值主检索 + 兜底 ---
+        return self._retrieve_classic(kb_id, query, query_vec, top_k, threshold, provider)
+
+    def _retrieve_classic(
+        self, kb_id: int, query: str, query_vec, top_k: int, threshold: float, provider: str,
+    ) -> List[SearchHit]:
+        """原向量检索路径：带阈值主检索 + 全景兜底 + 关键词加分。"""
         # 分数全景：先跑一次不过滤的 top，把最接近的 3 条分数打到 DEBUG，便于调阈值。
         try:
             overview = self.store.search(kb_id, query_vec, top_k=min(top_k + 3, 20), threshold=-1000.0)
@@ -127,6 +141,45 @@ class Retriever:
                          h.doc_id, h.chunk_index, h.score, tag,
                          (h.text or "")[:60].replace("\n", " "))
         return hits[:top_k]
+
+    def _retrieve_with_rerank(
+        self, kb_id: int, query: str, query_vec, top_k: int, provider: str,
+    ) -> List[SearchHit]:
+        """Rerank 路径：放宽阈值拉大候选池 → gte-rerank 精排 → 取 top_k。"""
+        recall_k = max(settings.RERANK_RECALL_TOP_K, top_k)
+        # 不过滤召回，让 rerank 自己做精排决策（阈值会丢掉本可重排到高分的候选）
+        try:
+            candidates = self.store.search(kb_id, query_vec, top_k=recall_k, threshold=-1000.0)
+        except Exception as e:
+            logger.warning("[Retriever] Rerank 路径召回失败 kb=%s err=%s → 回退 classic 路径",
+                           kb_id, str(e))
+            return self._retrieve_classic(kb_id, query, query_vec, top_k,
+                                          settings.SIMILARITY_THRESHOLD, provider)
+
+        if not candidates:
+            logger.info("[Retriever] Rerank 路径零召回 kb=%s query=%s",
+                        kb_id, query[:60])
+            return []
+
+        logger.debug("[Retriever] Rerank 召回 kb=%s candidates=%s top_scores=%s",
+                     kb_id, len(candidates),
+                     ", ".join("%.3f" % h.score for h in candidates[:3]))
+
+        # 调用 gte-rerank 精排；失败时 reranker 内部已回退到向量原始排序
+        reranked = reranker().rerank(query, candidates)
+
+        # 取 top_k 返回
+        final = reranked[:top_k]
+        logger.info("[Retriever] Rerank 完成 kb=%s candidates=%s final=%s provider=%s fp=%s",
+                    kb_id, len(candidates), len(final), provider, _FINGERPRINT)
+        for h in final[: min(3, len(final))]:
+            meta = h.metadata or {}
+            rs = meta.get("_rerank_score")
+            tag = f" [rerank={rs:.3f}]" if rs is not None else ""
+            logger.debug("  -> doc=%s chunk=%s score=%.3f%s text=%s",
+                         h.doc_id, h.chunk_index, h.score, tag,
+                         (h.text or "")[:60].replace("\n", " "))
+        return final
 
 
 retriever = Retriever()

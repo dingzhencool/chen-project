@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     # 生产环境可根据召回质量上提到 0.45~0.55。
     SIMILARITY_THRESHOLD: float = 0.35
 
+    # Rerank 精排配置：召回 top_k_recall 候选 → gte-rerank 重排 → 取 RETRIEVAL_TOP_K 给 LLM
+    # 失败不阻断问答，自动回退向量原始排序。
+    RERANK_ENABLED: bool = False
+    RERANK_BASE_URL: str = ""  # 默认走 https://dashscope.aliyuncs.com/api/v1
+    RERANK_API_KEY: str = ""   # 留空时复用 EMBEDDING_API_KEY 或 LLM_API_KEY
+    RERANK_MODEL: str = "gte-rerank"
+    RERANK_TOP_N: int = 6      # rerank 后返回的 top 数，建议与 RETRIEVAL_TOP_K 一致
+    RERANK_RECALL_TOP_K: int = 20  # 召回阶段拉多少候选参与 rerank（DashScope 文档上限 25）
+
     @property
     def SQLALCHEMY_DATABASE_URL(self) -> str:
         return (
