@@ -439,6 +439,10 @@ function renderContentParts(msg) {
 }
 
 onMounted(async () => {
+  // 防御性兜底：组件挂载前先清空残留状态，确保不显示上一用户的会话/消息
+  // 即使 user store 已在 login/logout 时调用 reset，这里再做一次保证 messages/currentKbId 等局部状态彻底干净
+  chatStore.reset()
+  currentKbId.value = null
   loadingList.value = true
   try {
     await Promise.all([

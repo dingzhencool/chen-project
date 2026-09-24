@@ -21,6 +21,13 @@ export const useChatStore = defineStore('chat', () => {
     return res.data
   }
 
+  function reset() {
+    conversations.value = []
+    total.value = 0
+    currentConversation.value = null
+    messages.value = []
+  }
+
   async function createOne(params) {
     const res = await createConversationApi(params)
     const item = res.data
@@ -87,6 +94,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConversation,
     messages,
     fetchList,
+    reset,
     createOne,
     updateOne,
     deleteOne,

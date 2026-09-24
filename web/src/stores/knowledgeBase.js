@@ -20,6 +20,12 @@ export const useKbStore = defineStore('knowledgeBase', () => {
     return res.data
   }
 
+  function reset() {
+    list.value = []
+    total.value = 0
+    current.value = null
+  }
+
   async function createOne(params) {
     const res = await createKbApi(params)
     return res.data
@@ -52,6 +58,7 @@ export const useKbStore = defineStore('knowledgeBase', () => {
     total,
     current,
     fetchList,
+    reset,
     createOne,
     updateOne,
     deleteOne,
