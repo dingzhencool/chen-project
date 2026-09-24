@@ -39,3 +39,6 @@ web/logs/
 
 # Tests (含本地测试隐私信息，不提交到仓库)
 server/tests/
+
+# Trae IDE 本地插件/技能目录（不上传仓库）
+.trae/
